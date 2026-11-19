@@ -1,0 +1,63 @@
+THIRD-PARTY NOTICES - Video and Image Compressor
+
+Video and Image Compressor is a PowerShell script. It starts three separate, unmodified
+programs through their command lines. It does not contain or link any of their code.
+Each of those programs keeps its own license, listed below.
+
+
+1. FFmpeg (ffmpeg.exe and ffprobe.exe) - used for VIDEO
+
+   Project:  https://ffmpeg.org
+   Build:    gyan.dev "essentials" build for Windows, unmodified
+             (run ffmpeg.exe -version to see the exact version)
+   License:  GNU General Public License version 3 (GPLv3).
+             Full text: LICENSE-FFmpeg.txt (in the same folder as this file)
+   Source:   The complete corresponding source code for this build is available from
+               https://www.gyan.dev/ffmpeg/builds/   (each release links its source)
+               https://github.com/GyanD/codexffmpeg/releases   (every build; each release page links its exact source)
+               https://ffmpeg.org/download.html
+             If these links ever stop working, contact the author through
+             https://github.com/Whitepumpkin24 and the source will be provided.
+   Note:     FFmpeg is a trademark of Fabrice Bellard, originator of the FFmpeg project.
+
+
+2. ImageMagick (imagemagick\magick.exe) - used for IMAGES
+
+   Project:    https://imagemagick.org
+   Copyright:  (C) 1999 ImageMagick Studio LLC
+   Build:      ImageMagick portable build for Windows (Q16-HDRI, x64), unmodified
+               (run imagemagick\magick.exe -version to see the exact version)
+   License:    ImageMagick License (very similar to the Apache 2.0 license).
+               Full text: imagemagick\LICENSE.txt, also at https://imagemagick.org/license/
+   Notices:    imagemagick\NOTICE.txt lists the third-party libraries that are built into
+               magick.exe, together with their licenses.
+   Source:     https://github.com/ImageMagick/ImageMagick
+               https://imagemagick.org/download/
+
+
+3. CaesiumCLT (caesium\caesiumclt.exe) - used for IMAGES
+
+   Project:    https://saerasoft.com/caesiumclt/
+   Author:     Lymphatus / SaeraSoft and contributors
+   Build:      CaesiumCLT 1.5.0, Windows x86_64 release, unmodified
+               (run caesium\caesiumclt.exe --version to see the exact version)
+   License:    Apache License, Version 2.0 (Apache-2.0).
+               Full text: caesium\LICENSE.md
+               https://www.apache.org/licenses/LICENSE-2.0
+   Docs:       caesium\README.md (upstream documentation)
+   Source:     https://github.com/Lymphatus/caesium-clt
+   Release:    https://github.com/Lymphatus/caesium-clt/releases/tag/v1.5.0
+   Engine:     libcaesium (https://github.com/Lymphatus/libcaesium).
+               Bundled dependencies retain their applicable licenses.
+               See the upstream release and source for dependency licensing.
+
+
+NO AFFILIATION
+This application is not affiliated with, endorsed by, or sponsored by the FFmpeg project,
+gyan.dev, ImageMagick Studio LLC, or SaeraSoft/CaesiumCLT.
+
+
+THIS APPLICATION
+The script, installer script and documentation of Video and Image Compressor are released
+under the MIT License (see the LICENSE file). Bundled FFmpeg, ImageMagick and CaesiumCLT
+remain subject to their respective licenses.
