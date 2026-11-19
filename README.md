@@ -191,4 +191,4 @@ The script, installer script and project documentation in this repo are released
 
 ## Author
 
-Whitepumpkin
+Whitepumpkin24
