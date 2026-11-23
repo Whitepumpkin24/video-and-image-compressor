@@ -1,0 +1,25 @@
+VIDEO AND IMAGE COMPRESSOR - USER AGREEMENT
+
+Please read this before installing.
+
+ABOUT THIS SOFTWARE
+Video and Image Compressor is a small hobby project. It was vibe-coded (written with the help of AI) as a PowerShell script that provides a simple window for compressing individual files or batches of videos or images to a target file size per file. Each batch uses shared compression settings and processes files sequentially. Videos are processed by FFmpeg (ffmpeg.exe and ffprobe.exe). For images, you can choose ImageMagick (magick.exe) or CaesiumCLT (caesiumclt.exe). All three are separate open-source programs bundled with this installer.
+
+USE AT YOUR OWN RISK
+This software is provided "AS IS", without warranty of any kind, express or implied. The author is not responsible for any loss of data, damaged or corrupted files, wasted time, or any other problem that may result from installing or using it. Always keep a copy of your original files. The tool is designed to write a new file and leave your original untouched, but you are responsible for your own files.
+
+LOCAL ERROR LOGS
+Unexpected errors may be recorded locally in %LOCALAPPDATA%\VideoImageCompressor\error.log, including file paths and diagnostic details. Error log rotation is configured for 5 MB per log with up to three backup logs (approximately 20 MB total). These logs are not automatically uploaded by the application.
+
+IF IN DOUBT, CHECK THE CODE
+You do not have to take anyone's word for what this software does. The whole program is a single readable text script (VideoImageCompressor.ps1) that you can open in Notepad after installation, in the install folder. The script is also published on GitHub by Whitepumpkin24: https://github.com/Whitepumpkin24
+If you are unsure or uncomfortable, review the script first, or do not install it.
+
+THIRD-PARTY SOFTWARE
+This installer includes three separate programs that are not part of the author's own code:
+- FFmpeg (ffmpeg.exe, ffprobe.exe), used for videos. It is the unmodified gyan.dev "essentials" build, licensed under the GNU General Public License version 3 (GPLv3). The license text is in the install folder (LICENSE-FFmpeg.txt). The source code for this build is available from https://www.gyan.dev/ffmpeg/builds/ and https://ffmpeg.org
+- ImageMagick (imagemagick\magick.exe), used for images. Copyright (C) 1999 ImageMagick Studio LLC. It is licensed under the ImageMagick License (https://imagemagick.org/license/). The license text is in the imagemagick folder inside the install folder (LICENSE.txt), and NOTICE.txt lists the third-party components built into it. Source code: https://github.com/ImageMagick/ImageMagick
+- CaesiumCLT (caesium\caesiumclt.exe), an alternative image compression engine that supports native target-size compression. It is the unmodified upstream Windows release, licensed under the Apache License 2.0. The license and upstream documentation are installed in the caesium folder (LICENSE.md and README.md). Source code: https://github.com/Lymphatus/caesium-clt
+Full details are in THIRD-PARTY-NOTICES.txt in the install folder. This application is not affiliated with or endorsed by the FFmpeg project, gyan.dev, ImageMagick Studio LLC or SaeraSoft/CaesiumCLT. Each third-party program retains its own license; this agreement does not replace or limit rights granted under those licenses.
+
+By clicking "I accept the agreement" you confirm that you have read this notice and agree to use the software at your own risk.

@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 <#
-  Video and Image Compressor GUI v2.1.0
+  Video and Image Compressor GUI v2.2.0
   Compress a video OR an image to a target file size.
    VIDEO (ffmpeg): MP4, MKV, MOV (H.264 + AAC) or WebM (VP9 + Opus).
                    Auto-detects a GPU encoder (NVIDIA / Intel / AMD), falls back to the CPU.
@@ -20,7 +20,7 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 # 1. CONFIG
 # =====================================================================
 $script:AppName = 'Video and Image Compressor'
-$script:AppVer  = '2.1.0'
+$script:AppVer  = '2.2.0'
 $script:Cfg = @{
     MaxMB          = 10000  # largest accepted target size
     MarginCpu      = 0.95   # 2-pass x264/VP9 is accurate -> 5% safety margin
@@ -34,6 +34,8 @@ $script:Cfg = @{
     ImgScaleMin    = 20     # minimum permitted resolution percentage
     ImgScaleMargin = 0.98   # safety margin when estimating resolution
     CaesiumPngOpt  = 6      # lossless PNG optimization level (0-6)
+    ErrorLogMax    = 5MB    # maximum size of each new error log
+    ErrorLogKeep   = 3      # number of rotated error logs to retain
 }
 $script:AppData = Join-Path $env:LOCALAPPDATA 'VideoImageCompressor'
 $script:ErrLog  = Join-Path $script:AppData 'error.log'
@@ -70,17 +72,60 @@ $script:ImageFormats = @(
 # =====================================================================
 # 2. ERROR HANDLING + TOOL LOOKUP
 # =====================================================================
+# ---- 2A. Error reporting and bounded log rotation ----
 [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
 
 function Show-Msg([string]$text, [string]$title = $script:AppName, [string]$buttons = 'OK', [string]$icon = 'Information') {
     return [System.Windows.Forms.MessageBox]::Show($text, $title, $buttons, $icon)
 }
 
+function Rotate-ErrorLog {
+    # Check every destination before altering any log; never follow links.
+    for ($i = 0; $i -le $script:Cfg.ErrorLogKeep; $i++) {
+        $path = if ($i -eq 0) { $script:ErrLog } else { "$($script:ErrLog).$i" }
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        if ($item -and ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint))) {
+            throw 'Unsafe error log path.'
+        }
+    }
+    $oldest = "$($script:ErrLog).$($script:Cfg.ErrorLogKeep)"
+    if ([IO.File]::Exists($oldest)) { Remove-Item -LiteralPath $oldest -Force -ErrorAction Stop }
+    for ($i = $script:Cfg.ErrorLogKeep - 1; $i -ge 1; $i--) {
+        $from = "$($script:ErrLog).$i"
+        if ([IO.File]::Exists($from)) { Move-Item -LiteralPath $from -Destination "$($script:ErrLog).$($i + 1)" -ErrorAction Stop }
+    }
+    if ([IO.File]::Exists($script:ErrLog)) { Move-Item -LiteralPath $script:ErrLog -Destination "$($script:ErrLog).1" -ErrorAction Stop }
+}
+
 function Write-ErrorLog([string]$msg) {
+    $mutex = $null; $locked = $false
     try {
-        if (-not (Test-Path -LiteralPath $script:AppData)) { New-Item -ItemType Directory -Path $script:AppData -Force | Out-Null }
-        Add-Content -LiteralPath $script:ErrLog -Value ("[{0}] {1}" -f (Get-Date -Format 's'), $msg)
+        # Serialize rotation across app instances in the same Windows session.
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $mutex = New-Object System.Threading.Mutex($false, "Local\VideoImageCompressor.ErrorLog.$sid")
+        try { $locked = $mutex.WaitOne(1000) } catch [System.Threading.AbandonedMutexException] { $locked = $true }
+        if (-not $locked) { return }
+        [void][IO.Directory]::CreateDirectory($script:AppData)
+        $dir = Get-Item -LiteralPath $script:AppData -Force -ErrorAction Stop
+        if ($dir.Attributes -band [IO.FileAttributes]::ReparsePoint) { return }
+        $item = Get-Item -LiteralPath $script:ErrLog -Force -ErrorAction SilentlyContinue
+        if ($item -and ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint))) { return }
+
+        $encoding = New-Object System.Text.UTF8Encoding($false)
+        $entry = "[{0}] {1}`r`n" -f (Get-Date -Format 's'), $msg
+        # Truncate exceptionally large entries so one error cannot fill a log.
+        if ($encoding.GetByteCount($entry) -gt $script:Cfg.ErrorLogMax) {
+            $limit = [int][math]::Floor(($script:Cfg.ErrorLogMax - 64) / 4)
+            $entry = $entry.Substring(0, $limit) + " [truncated]`r`n"
+        }
+        $size = if ($item) { $item.Length } else { 0 }
+        if ($size + $encoding.GetByteCount($entry) -gt $script:Cfg.ErrorLogMax) { Rotate-ErrorLog }
+        [IO.File]::AppendAllText($script:ErrLog, $entry, $encoding)
     } catch {}
+    finally {
+        if ($locked) { $mutex.ReleaseMutex() }
+        if ($mutex) { $mutex.Dispose() }
+    }
 }
 
 # The console is hidden when launched from the shortcut, so errors must be shown in a dialog.
@@ -96,6 +141,7 @@ function Show-Fatal([string]$msg) {
     [void](Show-Msg ("Unexpected error:`n" + $e.Exception.Message + "`n`nDetails: " + $script:ErrLog) 'Error' 'OK' 'Error')
 })
 
+# ---- 2B. Compression engine discovery ----
 function Find-Tool([string]$name, [string]$subDir = '') {
     $dirs = @()
     if ($PSScriptRoot) {
@@ -151,6 +197,15 @@ $script:outFile     = ''
 $script:outTmp      = ''                   # unique sibling .part file, published only on success
 $script:outOverwrite = $false             # existing output may be replaced only with confirmation
 $script:targetBytes = [long]0
+$script:batchFiles = @()
+$script:batchJobs = @()
+$script:batchActive = $false
+$script:batchIndex = 0
+$script:batchSuccess = 0
+$script:batchFailed = 0
+$script:batchPending = $false
+$script:batchCancelled = $false
+$script:selectionLock = $false
 
 # video run
 $script:pass        = 0
@@ -211,7 +266,7 @@ $rbImage.Text = 'Image'; $rbImage.Location = '150,12'; $rbImage.AutoSize = $true
 $form.Controls.Add($rbImage)
 
 # ---- files ----
-[void](New-Label 'Input file (drag & drop supported):' 15 45)
+[void](New-Label 'Input files (select or drop multiple files):' 15 45)
 $txtIn = New-Object System.Windows.Forms.TextBox
 $txtIn.Location = '15,65'; $txtIn.Size = '480,23'; $txtIn.AllowDrop = $true
 $form.Controls.Add($txtIn)
@@ -219,7 +274,7 @@ $btnIn = New-Object System.Windows.Forms.Button
 $btnIn.Text = 'Browse...'; $btnIn.Location = '505,63'; $btnIn.Size = '85,27'
 $form.Controls.Add($btnIn)
 
-[void](New-Label 'Output file:' 15 100)
+$lblOut = New-Label 'Output file:' 15 100
 $txtOut = New-Object System.Windows.Forms.TextBox
 $txtOut.Location = '15,120'; $txtOut.Size = '480,23'
 $form.Controls.Add($txtOut)
@@ -228,7 +283,7 @@ $btnOut.Text = 'Save as...'; $btnOut.Location = '505,118'; $btnOut.Size = '85,27
 $form.Controls.Add($btnOut)
 
 # ---- target size + format ----
-[void](New-Label 'Target size:' 15 160)
+$lblTarget = New-Label 'Target size:' 15 160
 $txtMB = New-Object System.Windows.Forms.TextBox
 $txtMB.Location = '95,157'; $txtMB.Size = '70,23'; $txtMB.MaxLength = 8   # starts empty on purpose
 $form.Controls.Add($txtMB)
@@ -376,6 +431,7 @@ function Get-Format {
 
 # Output name next to the input: <name>_compressed<ext>. Only touches the box when the input is a valid file of the current mode.
 function Sync-OutputName([bool]$clearIfNone) {
+    if ($script:batchFiles.Count -gt 1) { return }
     $path = $txtIn.Text.Trim().Trim('"')
     if (-not [string]::IsNullOrWhiteSpace($path) -and (Test-Path -LiteralPath $path -PathType Leaf) -and ((Get-MediaKind $path) -eq $script:mode)) {
         $dir  = Split-Path $path -Parent
@@ -419,6 +475,36 @@ function Set-Mode([string]$mode) {
     Update-Info
 }
 
+function Set-InputFiles([string[]]$paths) {
+    $paths = @($paths | Select-Object -Unique)
+    if ($paths.Count -eq 0) { return }
+    $kind = Get-MediaKind $paths[0]
+    foreach ($path in $paths) {
+        if (-not $kind -or (Get-MediaKind $path) -ne $kind -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            [void](Show-Msg 'Select only supported files of the same type (all videos or all images).' 'Selection' 'OK' 'Warning'); return
+        }
+    }
+    if ($kind -eq 'image' -and $script:ImageEngines.Count -eq 0) {
+        [void](Show-Msg 'No image compression engine is installed.' 'Selection' 'OK' 'Warning'); return
+    }
+    $script:batchFiles = $paths
+    $script:durPath = ''; $script:durVal = 0.0
+    $script:dimPath = ''; $script:dimVal = ''
+    $script:selectionLock = $true
+    try {
+        $multi = $paths.Count -gt 1
+        $txtIn.ReadOnly = $multi
+        $lblOut.Text = if ($multi) { 'Output folder (blank = original folders):' } else { 'Output file:' }
+        $btnOut.Text = if ($multi) { 'Folder...' } else { 'Save as...' }
+        $lblTarget.Text = if ($multi) { 'Each file:' } else { 'Target size:' }
+        $txtIn.Text = if ($multi) { "$($paths.Count) files: " + (($paths | ForEach-Object { [IO.Path]::GetFileName($_) }) -join '; ') } else { $paths[0] }
+        if ($multi) { $txtOut.Text = '' }
+        if ($kind -ne $script:mode) { Set-Mode $kind }
+        Sync-OutputName $true
+        Update-Info
+    } finally { $script:selectionLock = $false }
+}
+
 function Set-Busy([bool]$busy) {
     $script:busy       = $busy
     $btnGo.Enabled     = -not $busy
@@ -431,6 +517,10 @@ function Set-Busy([bool]$busy) {
 }
 
 function Update-Info {
+    if ($script:batchFiles.Count -gt 1) {
+        $lblInfo.Text = "$($script:batchFiles.Count) files selected | target applies to each file"
+        return
+    }
     $path = $txtIn.Text.Trim().Trim('"')
     if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
         $lblInfo.Text = $script:InfoDefault
@@ -574,20 +664,21 @@ function Get-ProgressSeconds {
 function Start-VideoRun {
     $script:scale    = $chkScale.Checked
     $script:duration = Get-Duration $script:inFile
-    if ($script:duration -le 0) { [void](Show-Msg 'Could not read the video duration. Is the file a valid video?' 'Error' 'OK' 'Warning'); return }
+    if ($script:duration -le 0) { if ($script:batchActive) { throw 'Could not read the video duration.' }; [void](Show-Msg 'Could not read the video duration. Is the file a valid video?' 'Error' 'OK' 'Warning'); return }
 
     Set-Encoder (Get-ChosenEncoder)
     $br = Get-Bitrates $script:duration $script:targetBytes
     if ($br.Video -lt $script:Cfg.MinVideoKbps) {
+        if ($script:batchActive) { throw 'Target is too small for this video.' }
         [void](Show-Msg "Target is too small for a $([int]$script:duration)s video. Increase the size." 'Error' 'OK' 'Warning'); return }
     if ($br.Video -lt $script:Cfg.LowQualityKbps) {
         $msg = "At $(Format-Bytes $script:targetBytes) the video quality will be very low ($($br.Video) kbps). Continue?"
-        if ((Show-Msg $msg 'Low quality warning' 'YesNo' 'Warning') -ne 'Yes') { return }
+        if ($script:batchActive) { Write-Log $msg } elseif ((Show-Msg $msg 'Low quality warning' 'YesNo' 'Warning') -ne 'Yes') { return }
     }
     $script:vkbps = $br.Video; $script:akbps = $br.Audio
 
     Initialize-RunPaths
-    $log.Clear(); $bar.Value = 0
+    if (-not $script:batchActive) { $log.Clear() }; Set-RunProgress 0
     Write-Log ("Video {0} | target {1} | video {2} kbps | audio {3} kbps" -f $script:fmt.Ext, (Format-Bytes $script:targetBytes), $script:vkbps, $script:akbps)
     Set-Busy $true
     $timer.Interval = $script:Cfg.TimerMs
@@ -598,7 +689,7 @@ function Start-VideoRun {
 function Step-VideoRun {
     $secs = Get-ProgressSeconds
     $pct  = if ($script:duration -gt 0) { [math]::Min(1.0, $secs / $script:duration) } else { 0 }
-    $bar.Value = [int]((($script:pass - 1) + $pct) / $script:totalPasses * 100)
+    Set-RunProgress ([int]((($script:pass - 1) + $pct) / $script:totalPasses * 100))
 
     if (-not $script:proc.HasExited) { return }
     $script:proc.WaitForExit()
@@ -618,6 +709,7 @@ function Step-VideoRun {
         }
         $detail = Get-ToolError
         Finish $false "ffmpeg failed on pass $($script:pass) (exit code $code). $detail"
+        if ($script:batchActive) { return }
         [void](Show-Msg "Compression failed.`n`n$detail" 'Error' 'OK' 'Error')
         return
     }
@@ -637,6 +729,7 @@ function Step-VideoRun {
     $msg = "Done: $($script:outFile)`n$(Format-Bytes $sizeBytes) (target $(Format-Bytes $script:targetBytes))"
     if ($sizeBytes -gt $script:targetBytes) { $msg += "`n`nWarning: the file is larger than the target. Try a smaller target size." }
     Finish $true ($msg -replace "`n", ' ')
+    if ($script:batchActive) { return }
     $r = Show-Msg ($msg + "`n`nOpen the output folder?") 'Done' 'YesNo' 'Information'
     if ($r -eq 'Yes') { Start-Process explorer.exe -ArgumentList "/select,`"$($script:outFile)`"" }
 }
@@ -728,6 +821,7 @@ function Complete-ImageRun([string]$how) {
     Publish-Output
     $msg = "Done: $($script:outFile)`n$(Format-Bytes $actual) (target $(Format-Bytes $script:targetBytes))`n$($script:imageEngine): $how"
     Finish $true ($msg -replace "`n", ' | ')
+    if ($script:batchActive) { return }
     $r = Show-Msg ($msg + "`n`nOpen the output folder?") 'Done' 'YesNo' 'Information'
     if ($r -eq 'Yes') { Start-Process explorer.exe -ArgumentList "/select,`"$($script:outFile)`"" }
 }
@@ -939,7 +1033,7 @@ function Start-MagickRun {
         # Best valid result.
         BestSize = [long]0; BestQ = 0; BestScale = 100
     }
-    $log.Clear(); $bar.Value = 0
+    if (-not $script:batchActive) { $log.Clear() }; Set-RunProgress 0
     $extra = if ($script:maxPx -gt 0) { " | max $($script:maxPx) px" } else { '' }
     Write-Log ("ImageMagick {0} | target {1}{2}" -f $fmt.Ext, (Format-Bytes $script:targetBytes), $extra)
     if ($hasICC) { Write-Log 'ICC color profile detected.' }
@@ -954,7 +1048,7 @@ function Start-MagickRun {
 
 function Step-MagickRun {
     $s = $script:img
-    $bar.Value = [int][math]::Min(95, 8 * $s.Tries)
+    Set-RunProgress ([int][math]::Min(95, 8 * $s.Tries))
     if (-not $script:proc.HasExited) { return }
     $script:proc.WaitForExit()
     $code = $script:proc.ExitCode
@@ -962,6 +1056,7 @@ function Step-MagickRun {
     if ($code -ne 0) {
         $detail = Get-ToolError
         Finish $false "ImageMagick failed (exit code $code). $detail"
+        if ($script:batchActive) { return }
         [void](Show-Msg "Image compression failed.`n`n$detail" 'Error' 'OK' 'Error')
         return
     }
@@ -976,6 +1071,7 @@ function Step-MagickRun {
         $msg = "Could not reach $(Format-Bytes $script:targetBytes), even at $($script:Cfg.ImgScaleMin)% resolution scale."
         if ($s.Kind -eq 'png') { $msg += " PNG is lossless, so try JPG or WebP." } else { $msg += " Choose a larger target." }
         Finish $false $msg
+        if ($script:batchActive) { return }
         [void](Show-Msg $msg 'Target too small' 'OK' 'Warning')
         return
     }
@@ -1050,7 +1146,7 @@ function Start-CaesiumRun {
         BaseEdge = $baseEdge; Scale = 100; ScaleLow = 0; ScaleHigh = 101; Tries = 0
         BestSize = [long]0; BestScale = 100
     }
-    $log.Clear(); $bar.Value = 0
+    if (-not $script:batchActive) { $log.Clear() }; Set-RunProgress 0
     $extra = if ($script:maxPx -gt 0) { " | max $($script:maxPx) px" } else { '' }
     Write-Log ("CaesiumCLT {0} | target {1}{2}" -f $fmt.Ext, (Format-Bytes $script:targetBytes), $extra)
     if ($script:strip) { Write-Log 'Metadata removal enabled; orientation retained where supported. JPEG ICC retained by default.' }
@@ -1063,7 +1159,7 @@ function Start-CaesiumRun {
 
 function Step-CaesiumRun {
     $s = $script:img
-    $bar.Value = [int][math]::Min(95, 8 * $s.Tries)
+    Set-RunProgress ([int][math]::Min(95, 8 * $s.Tries))
     if (-not $script:proc.HasExited) { return }
     $script:proc.WaitForExit()
     $code = $script:proc.ExitCode
@@ -1076,6 +1172,7 @@ function Step-CaesiumRun {
         $detail = if ($result.error) { $result.error } elseif ($fileResult.message) { $fileResult.message } else { Get-ToolError }
         if (-not $detail) { $detail = 'No valid output was produced.' }
         Finish $false "CaesiumCLT failed (exit code $code). $detail"
+        if ($script:batchActive) { return }
         [void](Show-Msg "CaesiumCLT compression failed.`n`n$detail" 'Error' 'OK' 'Error')
         return
     }
@@ -1105,6 +1202,7 @@ function Step-CaesiumRun {
     }
     if ($s.Kind -eq 'png') { $msg += ' PNG is lossless; try JPG or WebP.' }
     Finish $false $msg
+    if ($script:batchActive) { return }
     [void](Show-Msg $msg 'Target too small' 'OK' 'Warning')
 }
 
@@ -1208,6 +1306,58 @@ function Clear-RunFiles {
     $script:outOverwrite = $false
 }
 
+function Set-RunProgress([int]$percent) {
+    if ($script:batchActive) {
+        $percent = [int][math]::Floor((100 * $script:batchIndex + $percent) / $script:batchJobs.Count)
+    }
+    $bar.Value = [math]::Max(0, [math]::Min(100, $percent))
+}
+
+# ---- 9D. Batch queue and execution ----
+function Start-Batch {
+    $bytes = Get-TargetBytes
+    if ($bytes -le 0) { throw 'Enter a valid target size per file.' }
+    $fmt = Get-Format
+    $folder = $txtOut.Text.Trim().Trim('"')
+    if ($folder -and -not (Test-Path -LiteralPath $folder -PathType Container)) { throw 'The output folder does not exist.' }
+    $inputs = @($script:batchFiles | ForEach-Object { [IO.Path]::GetFullPath($_) })
+    $jobs = @()
+    foreach ($path in $inputs) {
+        if ((Get-MediaKind $path) -ne $script:mode -or ($script:mode -eq 'image' -and -not (Test-ImageEngineInput $path))) { throw "Unsupported input for selected mode or engine: $path" }
+        $item = Get-Item -LiteralPath $path -ErrorAction Stop
+        if ($item.Length -le 0) { throw "Empty input: $path" }
+        $dir = if ($folder) { [IO.Path]::GetFullPath($folder) } else { $item.DirectoryName }
+        $stem = [IO.Path]::GetFileNameWithoutExtension($path) + '_compressed'
+        $out = Join-Path $dir ($stem + $fmt.Ext)
+        $n = 2
+        while (($inputs -contains $out) -or ($jobs.Output -contains $out) -or (Test-Path -LiteralPath $out)) {
+            $out = Join-Path $dir ($stem + '_' + $n + $fmt.Ext); $n++
+        }
+        $jobs += [pscustomobject]@{ Input = $path; Output = $out }
+    }
+    $script:batchJobs = $jobs; $script:batchIndex = 0
+    $script:batchSuccess = 0; $script:batchFailed = 0
+    $script:batchCancelled = $false; $script:batchActive = $true
+    $script:fmt = $fmt; $script:targetBytes = $bytes
+    $log.Clear(); $bar.Value = 0
+    Set-Busy $true
+    $script:batchPending = $true; $timer.Start()
+}
+
+function Start-NextBatchFile {
+    $script:batchPending = $false
+    $job = $script:batchJobs[$script:batchIndex]
+    $script:inFile = $job.Input; $script:outFile = $job.Output; $script:outOverwrite = $false
+    $lblInfo.Text = "Compressing file $($script:batchIndex + 1) of $($script:batchJobs.Count)"
+    Write-Log "$($lblInfo.Text): $($job.Input)"
+    try {
+        if ($script:mode -eq 'image') { Start-ImageRun } else { Start-VideoRun }
+    } catch {
+        Write-ErrorLog $_.Exception.ToString()
+        Finish $false "Could not start: $($_.Exception.Message)"
+    }
+}
+
 # Cleanup + log only. Callers show any dialogs afterwards.
 function Finish([bool]$ok, [string]$msg) {
     $timer.Stop()
@@ -1217,21 +1367,39 @@ function Finish([bool]$ok, [string]$msg) {
         return
     }
     Clear-RunFiles
+    if ($script:batchActive) {
+        Write-Log $msg
+        if (-not $script:batchCancelled) {
+            if ($ok) { $script:batchSuccess++ } else { $script:batchFailed++ }
+            $script:batchIndex++
+        }
+        Set-RunProgress 0
+        if (-not $script:batchCancelled -and $script:batchIndex -lt $script:batchJobs.Count) {
+            $script:batchPending = $true; $timer.Start(); return
+        }
+        $summary = "Batch finished: $($script:batchSuccess) succeeded, $($script:batchFailed) failed, $($script:batchJobs.Count - $script:batchIndex) unprocessed."
+        $script:batchPending = $false; $script:batchActive = $false
+        Set-Busy $false; Update-Info; Write-Log $summary
+        return
+    }
     Set-Busy $false
     Write-Log $msg
     $bar.Value = if ($ok) { 100 } else { 0 }
 }
 
-# ---- 9D. Progress timer ----
+# ---- 9E. Progress timer ----
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = $script:Cfg.TimerMs
 $timer.Add_Tick({
     try {
+        if ($script:batchActive -and $script:batchPending) { Start-NextBatchFile; return }
+        if ($script:batchActive -and $script:batchCancelled) { Finish $false 'Cancelled.'; return }
         if (-not $script:busy -or -not $script:proc) { return }
         if ($script:mode -eq 'image') { Step-ImageRun } else { Step-VideoRun }
     } catch {
         Write-ErrorLog $_.Exception.ToString()
         Finish $false "Unexpected error: $($_.Exception.Message)"
+        if ($script:batchFiles.Count -gt 1) { return }
         [void](Show-Msg "Unexpected error:`n$($_.Exception.Message)`n`nDetails: $($script:ErrLog)" 'Error' 'OK' 'Error')
     }
 })
@@ -1256,9 +1424,15 @@ $btnIn.Add_Click({
     $dlg = New-Object System.Windows.Forms.OpenFileDialog
     $dlg.Filter      = "Supported files|$vid;$img|Video files|$vid|Image files|$img|All files|*.*"
     $dlg.FilterIndex = if ($script:mode -eq 'image') { 3 } else { 2 }
-    if ($dlg.ShowDialog() -eq 'OK') { $txtIn.Text = $dlg.FileName }
+    $dlg.Multiselect = $true
+    try { if ($dlg.ShowDialog() -eq 'OK') { Set-InputFiles $dlg.FileNames } } finally { $dlg.Dispose() }
 })
 $btnOut.Add_Click({
+    if ($script:batchFiles.Count -gt 1) {
+        $folderDlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        try { if ($folderDlg.ShowDialog() -eq 'OK') { $txtOut.Text = $folderDlg.SelectedPath } } finally { $folderDlg.Dispose() }
+        return
+    }
     $dlg = New-Object System.Windows.Forms.SaveFileDialog
     if ($script:mode -eq 'image') { $dlg.Filter = 'JPG image|*.jpg|WebP image|*.webp|PNG image|*.png' }
     else                          { $dlg.Filter = 'MP4 video|*.mp4|MKV video|*.mkv|MOV video|*.mov|WebM video|*.webm' }
@@ -1269,9 +1443,11 @@ $btnOut.Add_Click({
     }
 })
 $txtIn.Add_DragEnter({ if ($_.Data.GetDataPresent('FileDrop')) { $_.Effect = 'Copy' } })
-$txtIn.Add_DragDrop({ $txtIn.Text = ($_.Data.GetData('FileDrop'))[0] })
+$txtIn.Add_DragDrop({ if (-not $script:busy) { Set-InputFiles ($_.Data.GetData('FileDrop')) } })
 
 $txtIn.Add_TextChanged({
+    if ($script:selectionLock) { return }
+    $script:batchFiles = @()
     $path = $txtIn.Text.Trim().Trim('"')
     $script:durPath = ''; $script:durVal = 0.0
     $script:dimPath = ''; $script:dimVal = ''
@@ -1318,16 +1494,17 @@ $cmbFmt.Add_SelectedIndexChanged({
     if ($script:modeLock) { return }
     # keep the output file extension in sync with the chosen format
     $o = $txtOut.Text.Trim().Trim('"')
-    if ($o) { $txtOut.Text = [IO.Path]::ChangeExtension($o, (Get-Format).Ext) }
+    if ($o -and $script:batchFiles.Count -le 1) { $txtOut.Text = [IO.Path]::ChangeExtension($o, (Get-Format).Ext) }
     Update-EncoderUi
     Update-Info
 })
 
 # ---- run / cancel ----
-$btnCancel.Add_Click({ Finish $false 'Cancelled.' })
+$btnCancel.Add_Click({ if ($script:batchActive) { $script:batchCancelled = $true; $script:batchPending = $false }; Finish $false 'Cancelled.' })
 
 $btnGo.Add_Click({
     try {
+        if ($script:batchFiles.Count -gt 1) { Start-Batch; return }
         # ---- validate input ----
         $in = $txtIn.Text.Trim().Trim('"')
         if ([string]::IsNullOrWhiteSpace($in) -or -not (Test-Path -LiteralPath $in -PathType Leaf)) { [void](Show-Msg 'Select a valid input file.' 'Error' 'OK' 'Warning'); return }

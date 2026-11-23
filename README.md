@@ -1,9 +1,9 @@
 # Video and Image Compressor
 
-**Version 2.1.0**
+**Version 2.2.0**
 
-A simple Windows app that compresses a **video or a photo** down to a **target file size**.
-Pick a file, type a size (`20` MB for a video, `500` KB for a photo), click **Compress**, and get a smaller copy back.
+A simple Windows app that compresses **videos or photos** down to a **target file size per file**.
+Pick one or more files of the same media type, type a size (`20` MB per video, `500` KB per photo), click **Compress**, and get smaller copies back.
 
 - **Videos** are compressed with [FFmpeg](https://ffmpeg.org)
 - **Images** are compressed with either [ImageMagick](https://imagemagick.org) or [CaesiumCLT](https://saerasoft.com/caesiumclt/), selectable in the app
@@ -19,9 +19,11 @@ Built with a PowerShell GUI. Handy for Discord, email, and messaging upload limi
 - Choose MB or KB for the target size
 - Switches between Video and Image mode automatically when you pick a file
 - Drag and drop, progress bar, cancel button, live log
+- Batch compression: select multiple videos or multiple images, process them sequentially with shared settings, and see an overall progress bar and final summary.
 - Safe by design: writes a temporary `.part` file and only renames it when finished, so your original and any existing files are never damaged by a failed or cancelled run
 - Asks before overwriting an existing file
 - Clear error messages, with details logged to a file
+- Error log rotation: 5 MB per log, retaining up to three older logs (approximately 20 MB total).
 
 **Video (FFmpeg only)**
 - Output: MP4, MKV, MOV (H.264 + AAC) or WebM (VP9 + Opus)
@@ -63,11 +65,13 @@ This software uses FFmpeg (gyan.dev essentials build, licensed under the GPLv3).
 ## Usage
 
 1. Open **Video and Image Compressor**.
-2. Click **Browse** (or drag a file into the window). The mode switches to Video or Image for you.
+2. Click **Browse** (or drag files onto the input box). Use Ctrl or Shift to select multiple files of the same media type. The mode switches to Video or Image for you.
 3. If compressing an image, choose **ImageMagick** or **CaesiumCLT** in the **Image engine** dropdown. For videos, the GPU encoder is detected automatically.
 4. Type the **Target size** (the box starts empty, or use the **-** / **+** buttons), choose **MB** or **KB**, and pick the **Format**.
 5. Set any optional dimensions, metadata removal or video options, then click **Compress**.
 6. When it finishes, the file is saved next to the original as `name_compressed.<format>` by default (for example `holiday_compressed.mp4` or `photo_compressed.jpg`).
+
+For a batch, the target size applies to **each file**, not the combined size. Leave the output folder blank to save beside each original, or choose a common destination folder. Existing names are avoided using numbered suffixes. Failed files are logged and the remaining files are processed; Cancel stops the batch and keeps completed outputs.
 
 ## Run from source (no installer)
 
@@ -191,4 +195,4 @@ The script, installer script and project documentation in this repo are released
 
 ## Author
 
-Whitepumpkin24
+Whitepumpkin
